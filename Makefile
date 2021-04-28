@@ -5,11 +5,11 @@ SHELL := /bin/bash -o pipefail
 ENABLE_EH  ?= OFF
 BUILD_TYPE ?= Release
 ENABLE_ASSERTS ?= OFF
-CREATE_LLVM_PROF ?="create_llvm_prof"
+CREATE_LLVM_PROF ?="/google/bin/releases/autofdo/create_llvm_prof"
 RELEASE_LLVM_BIN ="/usr/bin"
 
 DDIR := $(shell pwd)
-LLVM_PROJECT ?= $(shell cd $(DDIR)/.. && pwd)
+LLVM_PROJECT ?= $(shell cd $(DDIR)/../llvm-project && pwd)
 CLANG_VERSION := $(shell sed -Ene 's!^\s+set\(LLVM_VERSION_MAJOR\s+([[:digit:]]+)\)$$!\1!p' ${LLVM_PROJECT}/llvm/CMakeLists.txt)
 
 check_environment:
@@ -66,8 +66,8 @@ FLAVORS            := stage1 pgo-vanilla pgo-split plain afdo-vanilla afdo-split
 ALL_COMPILERS      := $(foreach F,$(FLAVORS),$(F)-compiler)
 ALL_BENCHMARKS     := $(foreach F,$(FLAVORS),benchmark-$(F))
 
-gen_compiler_flags  = -DCMAKE_C_FLAGS=$(1) -DCMAKE_CXX_FLAGS=$(1)
-gen_linker_flags    = -DCMAKE_EXE_LINKER_FLAGS=$(1) -DCMAKE_SHARED_LINKER_FLAGS=$(1) -DCMAKE_MODULE_LINKER_FLAGS=$(1)
+gen_compiler_flags  = -DCMAKE_C_FLAGS=$(1) -DCMAKE_CXX_FLAGS=$(1) -fnopie
+gen_linker_flags    = -DCMAKE_EXE_LINKER_FLAGS=$(1) -DCMAKE_SHARED_LINKER_FLAGS=$(1) -DCMAKE_MODULE_LINKER_FLAGS=$(1) -nopie
 
 # $1 are compiler cluster.
 # $2 are ld flags.
@@ -76,10 +76,11 @@ gen_build_flags     = $(call gen_compiler_flags,$(1)) $(call gen_linker_flags,$(
 # Use "_opt" suffix to name a bare option, e.g., options that are to be wrapped by -DCMAKE_C_FLAGS="....".
 gc_sections_opt            := -Wl,-gc-sections
 keep_section_opt           := -Wl,-z,keep-text-section-prefix
-split_linker_opt           := -Wl,-lto-split-machine-functions -Wl,-z,keep-text-section-prefix
+ro_segment_opt 						 := -Wl,--no-rosegment
+split_linker_opt           := -Wl,-mllvm,-enable-split-machine-functions -Wl,-z,keep-text-section-prefix
 
 # Use "_flags" suffix to name cmake options, e.g., options that are wrapped by "-DCMAKE_XXX".
-split_flags := $(call gen_build_flags,"-mllvm -enable-split-machine-functions","${LLD_OPT} $(keep_section_opt)")
+split_flags := $(call gen_build_flags,"-fsplit-machine-functions","${LLD_OPT} $(split_linker_opt)")
 
 # $1 is any other cmake flags (optional)
 # $2 is llvm enabled projects
@@ -97,8 +98,8 @@ define build_compiler
 		-DCMAKE_BUILD_TYPE=$(BUILD_TYPE)                 \
 		-DLLVM_ENABLE_EH=$(ENABLE_EH)                    \
 		-DLLVM_ENABLE_RTTI=$(ENABLE_EH)                  \
-		-DLLVM_ENABLE_LLD="On"                           \
 		-DCMAKE_LINKER="lld"                             \
+		-DLLVM_ENABLE_LLD="On"                           \
 		-DLLVM_TARGETS_TO_BUILD="X86"                    \
 		-DCMAKE_C_COMPILER="$(__toolchain)/clang"        \
 		-DCMAKE_CXX_COMPILER="$(__toolchain)/clang++"    \
@@ -141,7 +142,7 @@ stage-pgo-vanilla.profdata: %.profdata: %-compiler run-commands.sh  | stage1-com
 	$(STAGE1_BIN)/llvm-profdata merge -output=$@ `find $(dir $(shell readlink -f $<))../ -path "*/csprofiles/*.profraw" -o -path "*/profiles/*.profraw"`
 
 pgo-vanilla/build/bin/clang-${CLANG_VERSION}: stage-pgo-vanilla.profdata
-	$(call build_compiler,-DLLVM_PROFDATA_FILE=$(DDIR)/$< $(call gen_linker_flags,"$(gc_sections_opt) $(keep_section_opt)"),"clang;compiler-rt;lld",clang lld)
+	$(call build_compiler,-DLLVM_PROFDATA_FILE=$(DDIR)/$< -DLLVM_ENABLE_LTO=Thin $(call gen_linker_flags,"$(gc_sections_opt) $(keep_section_opt)"),"clang;compiler-rt;lld",clang lld)
 
 pgo-hcs/build/bin/clang-${CLANG_VERSION}: stage-pgo-vanilla.profdata
 	$(call build_compiler,-DLLVM_PROFDATA_FILE=$(DDIR)/$< $(call gen_build_flags,"-mllvm --hot-cold-split -mllvm -enable-cold-section","$(gc_sections_opt) $(keep_section_opt)"),"clang;compiler-rt;lld",clang lld)
@@ -150,16 +151,16 @@ plain/build/bin/clang-${CLANG_VERSION}: | stage1-compiler
 	$(call build_compiler, -DLLVM_ENABLE_LTO=Thin $(call gen_build_flags,"-g","-fuse-ld=lld $(gc_sections_opt) $(keep_section_opt) $(ro_segment_opt)"),"clang;compiler-rt;lld",clang lld)
 
 afdo-vanilla/build/bin/clang-${CLANG_VERSION}: plain.afdo
-	$(call build_compiler,-DLLVM_SAMPLEPROF_FILE=$(DDIR)/$< -DLLVM_ENABLE_LTO=Thin $(call gen_linker_flags,"$(gc_sections_opt) $(keep_section_opt)"),"clang;compiler-rt;lld",clang lld)
+	$(call build_compiler,-DLLVM_ENABLE_LTO=Thin $(call gen_build_flags,-fprofile-sample-use=$(DDIR)/$< ,"$(gc_sections_opt) $(keep_section_opt) ${LLD_OPT}"),"clang;compiler-rt;lld",clang lld)
 
 afdo-split/build/bin/clang-${CLANG_VERSION}: plain.afdo
-	$(call build_compiler,-DLLVM_SAMPLEPROF_FILE=$(DDIR)/$< -DLLVM_ENABLE_LTO=Thin $(call split_flags),"clang;compiler-rt;lld",clang lld)
+	$(call build_compiler,-DLLVM_ENABLE_LTO=Thin $(call gen_build_flags,-fprofile-sample-use=$(DDIR)/$< -fsplit-machine-functions,"${LLD_OPT} $(split_linker_opt)"),"clang;compiler-rt;lld",clang lld)
 
 pgo-split/build/bin/clang-${CLANG_VERSION}: stage-pgo-vanilla.profdata stage1-compiler
-	$(call build_compiler,-DLLVM_PROFDATA_FILE=$(DDIR)/$< $(call split_flags),"clang;compiler-rt;lld",clang lld)
+	$(call build_compiler,-DLLVM_PROFDATA_FILE=$(DDIR)/$< -DLLVM_ENABLE_LTO=Thin $(call split_flags),"clang;compiler-rt;lld",clang lld)
 
 plain.perfdata: plain-compiler run-commands.sh
-	perf record -o $@ -e br_inst_retired.near_taken:u -j any,u -- ./run-commands.sh $(shell readlink -f $<)
+	/google/data/ro/projects/perf/perf record -o $@ -e br_inst_retired.near_taken:u -j any,u -- ./run-commands.sh $(shell readlink -f $<)
 
 # The internal version of create_llvm_prof must be used here since the open source version cannot produce a
 # format which is compatible with llvm as of 07/24/20.
@@ -169,7 +170,7 @@ plain.afdo: plain-compiler plain.perfdata
 benchmark-dir.o: | stage1-compiler
 	mkdir -p benchmark-dir/source
 	mkdir -p benchmark-dir/build
-	rsync -av -f "- .git*" -f "+ clang/***" -f "+ lld/***" -f "+ llvm/***" -f "- *" $(LLVM_PROJECT)/ benchmark-dir/source/
+	rsync -av -f "- .git*" -f "+ clang/***" -f "+ lld/***" -f "+ llvm/***" -f "+ libunwind/***" -f "- *" $(LLVM_PROJECT)/ benchmark-dir/source/
 	cd benchmark-dir/build ; \
 		export TOOLCHAIN="$(DDIR)/stage1/install/bin" ; \
 		cmake -G Ninja -DCMAKE_C_COMPILER=$${TOOLCHAIN}/clang -DCMAKE_CXX_COMPILER=$${TOOLCHAIN}/clang++ -DCMAKE_ASM_COMPILER=$${TOOLCHAIN}/clang \
